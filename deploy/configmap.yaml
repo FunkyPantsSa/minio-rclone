@@ -1,0 +1,69 @@
+# deploy/configmap.yaml —— 独立运行模式（web + rclone）的配置
+#
+# 架构说明：应用直接 exec rclone 执行备份，不再经过 Kubernetes Job/CronJob，
+# 因此这里只需要两类配置：
+#   1) rclone-conf：rclone 的远程定义（env_auth=true，AK/SK 通过环境变量注入，不进配置文件）
+#   2) backup-controller-config：应用本身的全部环境变量
+#
+# 部署方式二选一：
+#   - Kubernetes：kubectl apply -f configmap.yaml（配合 deployment.yaml，凭证经 Secret 注入）
+#   - 纯主机/docker run：把备份目录与数据目录挂载进容器，用 -e 或环境文件传入同等变量，
+#     AK/SK 用 -e AWS_ACCESS_KEY_ID=... -e AWS_SECRET_ACCESS_KEY=... 传入
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rclone-conf
+  namespace: middleware
+data:
+  # rclone 远程配置：仅定义远程与端点，凭证走 env_auth（环境变量 AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY）
+  rclone.conf: |
+    [remote_s3]
+    type = s3
+    provider = Minio
+    env_auth = true
+    endpoint = http://minio.middleware:9000
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: backup-controller-config
+  namespace: middleware
+data:
+  # ---------- rclone 与备份路径 ----------
+  RCLONE_BIN: rclone                  # rclone 可执行文件（镜像内已内置）
+  RCLONE_CONFIG_PATH: /config/rclone.conf  # rclone.conf 挂载路径
+  RCLONE_REMOTE: remote_s3            # 远程名，对应 rclone.conf 的 [remote_s3]
+  RCLONE_BUCKET: YOUR_BUCKET          # ⚠️ 替换为真实桶名
+  RCLONE_SOURCE_SUBDIR: ""            # 桶内子目录，空 = 整个桶
+  BACKUP_DEST_DIR: /data              # 备份目标目录（挂载的磁盘目录）
+  DATA_DIR: /data/bc                  # 运行数据目录：SQLite 数据库 + 任务日志
+
+  # ---------- rclone 命令参数 ----------
+  RCLONE_BW_LIMIT: 5M                 # 带宽上限
+  RCLONE_TRANSFERS: "4"               # 并发传输数
+  RCLONE_CHECKERS: "8"                # 并发检查数
+  RCLONE_RETRIES: "3"                 # 失败重试次数
+  RCLONE_RETRIES_SLEEP: 10s           # 重试间隔
+  RCLONE_STATS_INTERVAL: 5s           # 进度输出间隔（页面实时进度依赖）
+  RCLONE_LOG_LEVEL: INFO
+  RCLONE_FAST_LIST: "true"
+  RCLONE_USE_SERVER_MODTIME: "true"
+  RCLONE_USE_JSON_LOG: "true"         # 必须开启，页面进度解析依赖 JSON 统计行
+
+  # ---------- 定时增量调度（内置调度器，等价于原 CronJob） ----------
+  CRON_SCHEDULE: "*/10 * * * *"       # cron 表达式
+  CRON_SUSPEND: "false"               # 初始是否暂停
+  INCREMENTAL_MAX_DURATION: 25m       # 单次增量最长运行时间
+  MANUAL_INCREMENTAL_MAX_DURATION: "" # 手动增量时长限制（留空则同上）
+  SUCCESSFUL_HISTORY_LIMIT: "10"      # 成功任务历史保留数
+  FAILED_HISTORY_LIMIT: "10"          # 失败/中断任务历史保留数
+
+  # ---------- 登录认证（固定账号密码） ----------
+  LOGIN_USERNAME: admin               # 控制台登录用户名
+  LOGIN_PASSWORD: admin123            # ⚠️ 控制台登录密码（上线前必须修改！）
+  AUTH_SECRET: ""                     # 会话签名密钥；留空则启动时随机生成（重启后需重新登录）
+
+  # 说明：AK/SK 不放在 ConfigMap 中（敏感信息），
+  # K8s 部署时由 deployment.yaml 从 Secret rclone-secret 注入；
+  # docker run 时用 -e AWS_ACCESS_KEY_ID=... -e AWS_SECRET_ACCESS_KEY=... 传入。

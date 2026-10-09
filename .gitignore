@@ -1,0 +1,21 @@
+# macOS
+.DS_Store
+
+# 本地运行数据（SQLite 数据库 / 任务日志 / 备份产物），不入库
+test/
+data/
+*.db
+*.db-wal
+*.db-shm
+logs/
+
+# Go 构建缓存与临时产物
+.gocache/
+.gopath/
+*.test
+minio-rclone-backup-controller
+backup-controller/backup-controller
+
+# 编辑器
+.idea/
+.vscode/

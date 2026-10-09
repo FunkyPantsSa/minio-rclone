@@ -1,0 +1,9 @@
+# deploy/namespace.yaml —— 备份控制台所在命名空间
+#
+# 应用：kubectl apply -f namespace.yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: middleware
+  labels:
+    app: backup-controller

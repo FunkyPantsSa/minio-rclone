@@ -1,0 +1,111 @@
+# deploy/deployment.yaml —— 备份控制台（web + rclone 独立模式）Deployment + Service
+#
+# 说明：
+#   - 本应用不再调用 Kubernetes API（不创建 Job/CronJob），备份由应用直接 exec rclone 完成；
+#     因此不需要 ServiceAccount/RBAC，只需把两个目录挂载进来：
+#       * 备份目标目录（BACKUP_DEST_DIR=/data）    ← hostPath /data/mc_backup
+#       * 运行数据目录（DATA_DIR=/data/bc，SQLite + 日志）← hostPath /data/bc
+#   - 凭证：AK/SK 经 Secret rclone-secret 注入环境变量（rclone.conf 使用 env_auth=true）
+#   - 业务配置通过 envFrom 挂载 backup-controller-config（见 configmap.yaml）
+#   - 镜像地址请替换为内部 Harbor 的实际地址
+#   - 也可以完全不用 K8s：docker run -p 8000:8000 -v /data/mc_backup:/data \
+#       -v /data/bc:/data/bc -e RCLONE_BUCKET=... -e AWS_ACCESS_KEY_ID=... -e AWS_SECRET_ACCESS_KEY=...
+#
+# 应用：kubectl apply -f deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backup-controller
+  namespace: middleware
+  labels:
+    app: backup-controller
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: backup-controller
+  template:
+    metadata:
+      labels:
+        app: backup-controller
+    spec:
+      containers:
+        - name: backup-controller
+          image: harbor.internal/base/backup-controller:v0.0.2   # TODO: 替换为内部 Harbor 镜像
+          ports:
+            - name: http
+              containerPort: 8000
+          # 业务配置全部来自 backup-controller-config
+          envFrom:
+            - configMapRef:
+                name: backup-controller-config
+          env:
+            # AK/SK（敏感信息放在 Secret 中，rclone.conf 的 env_auth=true 会读取这两个环境变量）
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: rclone-secret
+                  key: AWS_ACCESS_KEY_ID
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: rclone-secret
+                  key: AWS_SECRET_ACCESS_KEY
+            - name: PORT
+              value: "8000"
+          volumeMounts:
+            - name: backup-data     # 备份目标目录
+              mountPath: /data
+            - name: bc-data         # 运行数据（SQLite + 日志）
+              mountPath: /data/bc
+            - name: rclone-conf     # rclone 远程配置（只读）
+              mountPath: /config
+              readOnly: true
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 5
+      volumes:
+        - name: backup-data
+          hostPath:
+            path: /data/mc_backup    # 节点本地磁盘（备份落盘位置）
+            type: DirectoryOrCreate
+        - name: bc-data
+          hostPath:
+            path: /data/bc           # SQLite 数据库与任务日志
+            type: DirectoryOrCreate
+        - name: rclone-conf
+          configMap:
+            name: rclone-conf
+            defaultMode: 0444
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: backup-controller
+  namespace: middleware
+  labels:
+    app: backup-controller
+spec:
+  type: ClusterIP
+  selector:
+    app: backup-controller
+  ports:
+    - name: http
+      port: 80          # 集群内访问：http://backup-controller.middleware
+      targetPort: http  # 转发到容器 8000

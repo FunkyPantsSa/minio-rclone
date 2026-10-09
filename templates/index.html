@@ -1,0 +1,706 @@
+<!DOCTYPE html>
+<!--
+  templates/index.html —— MinIO 备份控制台前端（备份全流程管理工具）
+  原生 HTML/CSS/JavaScript，无任何第三方依赖，通过 fetch / EventSource 与后端 REST API 交互。
+  架构：独立运行模式（web + rclone 单进程组合），任务由后端直接 exec rclone 执行，
+  运行数据持久化在 SQLite（DATA_DIR），页面展示实时进度与历史任务。
+  API 约定（均由后端 handlers.go 提供）：
+    POST   /api/full-backup                启动全量备份
+    POST   /api/incremental-backup         启动手动增量备份
+    POST   /api/cronjob/suspend            暂停/恢复定时调度（{"suspend": true|false}）
+    GET    /api/cronjob/status             定时调度详情（计划/上次/下次执行/历史保留）
+    GET    /api/tasks                      任务列表
+    GET    /api/tasks/{name}/logs?tail=200 静态日志
+    GET    /api/tasks/{name}/logs/stream   SSE 流式日志
+    GET    /api/tasks/{name}/progress      实时进度
+    DELETE /api/tasks/{name}               删除任务
+-->	
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MinIO 备份控制台</title>
+<style>
+  /* ---------- 基础样式 ---------- */
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+                 "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    background: #f5f7fa;
+    color: #333;
+    padding: 20px;
+  }
+  header { margin-bottom: 16px; }
+  h1 { font-size: 24px; color: #2c3e50; }
+  .sub { color: #7f8c8d; font-size: 13px; margin-top: 4px; }
+
+  /* ---------- 按钮 ---------- */
+  .toolbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 16px; }
+  .btn {
+    border: none; border-radius: 4px; padding: 8px 16px; font-size: 14px;
+    cursor: pointer; background: #ecf0f1; color: #2c3e50; transition: opacity .15s;
+  }
+  .btn:hover { opacity: .85; }
+  .btn.primary   { background: #3498db; color: #fff; }
+  .btn.secondary { background: #2ecc71; color: #fff; }
+  .btn.warning   { background: #f39c12; color: #fff; }
+  .btn.success   { background: #27ae60; color: #fff; }
+  .btn.small     { padding: 4px 10px; font-size: 12px; }
+  .state { font-size: 13px; color: #7f8c8d; }
+  .msg { font-size: 13px; margin-left: 6px; }
+  .msg.ok { color: #27ae60; }
+  .msg.error { color: #e74c3c; }
+
+  /* ---------- 面板 / 卡片 ---------- */
+  .panel {
+    background: #fff; border-radius: 6px; padding: 16px 20px;
+    box-shadow: 0 1px 3px rgba(0,0,0,.08); margin-bottom: 16px;
+  }
+  .panel h2 { font-size: 16px; color: #2c3e50; margin-bottom: 12px; }
+  .panel.hidden { display: none; }
+
+  /* 统计卡片行 */
+  .stats { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }
+  .stat {
+    flex: 1; min-width: 120px; background: #fff; border-radius: 6px;
+    box-shadow: 0 1px 3px rgba(0,0,0,.08); padding: 12px 16px; text-align: center;
+  }
+  .stat .num { display: block; font-size: 24px; font-weight: 700; color: #2c3e50; }
+  .stat .lbl { font-size: 12px; color: #95a5a6; margin-top: 2px; }
+  .stat.blue .num { color: #3498db; }
+  .stat.green .num { color: #2ecc71; }
+  .stat.red .num { color: #e74c3c; }
+
+  /* 定时任务详情 */
+  .cron-grid {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+    gap: 10px 24px; font-size: 13px;
+  }
+  .cron-grid .item .label { color: #95a5a6; display: block; font-size: 12px; }
+  .cron-grid .item .value { color: #2c3e50; font-weight: 600; word-break: break-all; }
+
+  /* ---------- 表格 ---------- */
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { padding: 10px 12px; text-align: left; border-bottom: 1px solid #ecf0f1; }
+  th { background: #f8f9fa; color: #7f8c8d; font-weight: 600; white-space: nowrap; }
+  tr:hover td { background: #fafbfc; }
+  .mono { font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 13px; }
+  .ops button {
+    border: none; border-radius: 3px; padding: 4px 10px; margin-right: 6px;
+    font-size: 12px; cursor: pointer; background: #3498db; color: #fff;
+  }
+  .ops button.danger { background: #e74c3c; }
+  .empty { color: #95a5a6; font-size: 13px; padding: 12px 0; }
+
+  /* 表格内进度条 */
+  .cell-progress { display: flex; align-items: center; gap: 8px; min-width: 120px; }
+  .cell-progress .track {
+    flex: 1; height: 8px; background: #ecf0f1; border-radius: 4px; overflow: hidden;
+  }
+  .cell-progress .bar { height: 100%; width: 0; background: #3498db; border-radius: 4px; }
+  .cell-progress .pct { font-size: 12px; color: #555; min-width: 42px; text-align: right; }
+
+  /* ---------- 状态徽章 ---------- */
+  .badge { display: inline-block; padding: 2px 10px; border-radius: 10px; font-size: 12px; }
+  .badge.running { background: #3498db; color: #fff; }
+  .badge.success { background: #2ecc71; color: #fff; }
+  .badge.failed  { background: #e74c3c; color: #fff; }
+  .badge.pending { background: #bdc3c7; color: #fff; }
+
+  /* ---------- 日志面板 ---------- */
+  .panel-head { display: flex; align-items: center; gap: 16px; margin-bottom: 10px; flex-wrap: wrap; }
+  .panel-head h2 { margin-bottom: 0; }
+  .panel-head label { font-size: 13px; color: #555; cursor: pointer; }
+  .log {
+    background: #1e272e; color: #d8dee9; font-family: "SF Mono", Menlo, Consolas, monospace;
+    font-size: 12px; line-height: 1.6; padding: 12px; border-radius: 4px;
+    height: 360px; overflow-y: auto; white-space: pre-wrap; word-break: break-all;
+  }
+
+  /* ---------- 进度面板 ---------- */
+  .progress-wrap { display: flex; align-items: center; gap: 12px; margin: 8px 0 16px; }
+  .progress-track {
+    flex: 1; height: 18px; background: #ecf0f1; border-radius: 9px; overflow: hidden;
+  }
+  .progress-bar {
+    height: 100%; width: 0; background: #3498db; border-radius: 9px;
+    transition: width .5s ease;
+  }
+  .percent { font-size: 14px; font-weight: 600; min-width: 60px; text-align: right; }
+  .progress-detail { list-style: none; font-size: 14px; }
+  .progress-detail li {
+    display: flex; justify-content: space-between; padding: 6px 0;
+    border-bottom: 1px dashed #ecf0f1; max-width: 520px;
+  }
+  .progress-detail .label { color: #7f8c8d; }
+  .progress-detail .value { font-family: "SF Mono", Menlo, Consolas, monospace; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>MinIO 备份控制台</h1>
+  <p class="sub">基于 rclone 的 MinIO → 本地磁盘备份全流程管理（全量 / 定时增量 / 手动增量）</p>
+</header>
+
+<!-- 操作按钮区 -->
+<section class="toolbar">
+  <button id="btnFull" class="btn primary" onclick="triggerFull()">触发全量备份</button>
+  <button id="btnIncr" class="btn secondary" onclick="triggerIncremental()">触发增量备份</button>
+  <button id="btnSuspend" class="btn warning" onclick="toggleSuspend()">暂停定时备份</button>
+  <button class="btn" onclick="toggleConfigPanel()">当前配置</button>
+  <button class="btn" onclick="refreshAll()">刷新</button>
+  <button class="btn" onclick="logout()">退出登录</button>
+  <span id="msg" class="msg"></span>
+</section>
+
+<!-- 统计卡片行 -->
+<section class="stats">
+  <div class="stat blue"><span class="num" id="statRunning">0</span><span class="lbl">运行中</span></div>
+  <div class="stat green"><span class="num" id="statSuccess">0</span><span class="lbl">成功</span></div>
+  <div class="stat red"><span class="num" id="statFailed">0</span><span class="lbl">失败</span></div>
+  <div class="stat"><span class="num" id="statTotal">0</span><span class="lbl">任务总数</span></div>
+  <div class="stat"><span class="num" id="statManual">0</span><span class="lbl">手动增量</span></div>
+</section>
+
+<!-- 当前配置面板（默认隐藏，点击「当前配置」展开） -->
+<section id="configPanel" class="panel hidden">
+  <div class="panel-head">
+    <h2>当前配置</h2>
+    <span style="font-size:12px;color:#95a5a6;">来源：backup-controller-config（环境变量）</span>
+    <button class="btn small" onclick="closeConfigPanel()">关闭</button>
+  </div>
+  <table id="configTable">
+    <thead><tr><th>配置项</th><th>值</th></tr></thead>
+    <tbody></tbody>
+  </table>
+</section>
+
+<!-- 定时任务详情面板 -->
+<section class="panel" id="cronPanel">
+  <h2>定时增量备份</h2>
+  <div class="cron-grid">
+    <div class="item"><span class="label">状态</span><span class="value" id="cronStatus">-</span></div>
+    <div class="item"><span class="label">计划</span><span class="value" id="cronSchedule">-</span></div>
+    <div class="item"><span class="label">上次执行</span><span class="value" id="cronLastRun">-</span></div>
+    <div class="item"><span class="label">下次执行</span><span class="value" id="cronNextRun">-</span></div>
+    <div class="item"><span class="label">上次成功</span><span class="value" id="cronLastSuccess">-</span></div>
+    <div class="item"><span class="label">并发策略</span><span class="value" id="cronConcurrency">-</span></div>
+    <div class="item"><span class="label">活跃任务</span><span class="value" id="cronActive">-</span></div>
+    <div class="item"><span class="label">历史保留（成功/失败）</span><span class="value" id="cronHistory">-</span></div>
+  </div>
+</section>
+
+<!-- Job 列表 -->
+<section class="panel">
+  <h2>备份任务列表 <span style="font-weight:400;color:#95a5a6;font-size:12px;">（每 10 秒自动刷新，运行中任务实时显示进度）</span></h2>
+  <table id="jobTable">
+    <thead>
+      <tr>
+        <th>任务名</th>
+        <th>类型</th>
+        <th>状态</th>
+        <th>进度</th>
+        <th>开始时间</th>
+        <th>完成时间</th>
+        <th>操作</th>
+      </tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+  <p id="empty" class="empty">暂无备份任务</p>
+</section>
+
+<!-- 日志面板（默认隐藏） -->
+<section id="logPanel" class="panel hidden">
+  <div class="panel-head">
+    <h2>任务日志 — <span id="logTitle"></span></h2>
+    <label><input type="checkbox" id="streamToggle" onchange="toggleStream()"> 流式刷新（实时追加）</label>
+    <button class="btn small" onclick="closeLogPanel()">关闭</button>
+  </div>
+  <pre id="logContent" class="log"></pre>
+</section>
+
+<!-- 进度面板（默认隐藏） -->
+<section id="progressPanel" class="panel hidden">
+  <div class="panel-head">
+    <h2>备份进度 — <span id="progressTitle"></span></h2>
+    <button class="btn small" onclick="refreshProgress()">刷新</button>
+    <button class="btn small" onclick="closeProgressPanel()">关闭</button>
+  </div>
+  <div class="progress-wrap">
+    <div class="progress-track"><div id="progressBar" class="progress-bar"></div></div>
+    <span id="progressPercent" class="percent">0%</span>
+  </div>
+  <ul id="progressDetail" class="progress-detail"></ul>
+</section>
+
+<script>
+// ===========================================================================
+// 全局状态
+// ===========================================================================
+let currentLogJob = null;      // 日志面板当前对应的 Job 名
+let currentProgressJob = null; // 进度面板当前对应的 Job 名
+let streamSource = null;       // EventSource 实例
+let streamErrors = 0;          // 流式重连失败计数
+let logTimer = null;           // 日志自动滚动定时器
+let progressTimer = null;      // 进度轮询定时器
+
+// ===========================================================================
+// 通用工具
+// ===========================================================================
+
+// api 封装 fetch：非 2xx 时抛出后端返回的 error 信息；未登录（401）跳转登录页
+async function api(url, options) {
+  const resp = await fetch(url, options);
+  if (resp.status === 401) {
+    location.href = '/login'; // 会话失效 → 登录页
+    throw new Error('未登录或会话已过期');
+  }
+  if (!resp.ok) {
+    let detail = 'HTTP ' + resp.status + ' ' + resp.statusText;
+    try {
+      const body = await resp.json();
+      if (body && body.error) detail = body.error;
+    } catch (e) { /* 响应非 JSON 时保留默认信息 */ }
+    throw new Error(detail);
+  }
+  return resp;
+}
+
+// 退出登录：清除会话 Cookie 并跳转登录页
+async function logout() {
+  try { await api('/api/logout', { method: 'POST' }); } catch (e) { /* 忽略 */ }
+  location.href = '/login';
+}
+
+// 页面消息提示（几秒后自动消失）
+function showMsg(text, isError) {
+  const el = document.getElementById('msg');
+  el.textContent = text;
+  el.className = 'msg ' + (isError ? 'error' : 'ok');
+  setTimeout(() => { el.textContent = ''; }, 5000);
+}
+
+// HTML 转义，防止任务名等注入
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  })[c]);
+}
+
+// 时间格式化（ISO → 本地可读文本）
+function fmtTime(t) {
+  if (!t) return '-';
+  const d = new Date(t);
+  if (isNaN(d.getTime())) return '-';
+  return d.toLocaleString('zh-CN', { hour12: false });
+}
+
+// 字节数格式化
+function fmtBytes(n) {
+  if (n === undefined || n === null) return '-';
+  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+  let i = 0, v = n;
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+  return (v >= 100 ? v.toFixed(0) : v.toFixed(1)) + ' ' + units[i];
+}
+
+// 耗时格式化（秒 → X时X分X秒）
+function fmtDuration(sec) {
+  if (sec === undefined || sec === null) return '-';
+  const s = Math.floor(sec);
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const ss = s % 60;
+  return h + '时' + m + '分' + ss + '秒';
+}
+
+// 状态徽章 HTML
+function statusBadge(status) {
+  const map = { '运行中': 'running', '成功': 'success', '失败': 'failed', '等待中': 'pending' };
+  return '<span class="badge ' + (map[status] || 'pending') + '">' + escapeHtml(status) + '</span>';
+}
+
+// ===========================================================================
+// Job 列表 + 统计
+// ===========================================================================
+
+// 拉取任务列表并渲染（含统计卡片）
+async function loadJobs() {
+  try {
+    const resp = await api('/api/tasks');
+    const jobs = await resp.json();
+    renderStats(jobs);
+    renderTable(jobs);
+    loadRunningProgress(jobs); // 为运行中的任务补充进度列
+  } catch (e) {
+    showMsg('加载任务列表失败: ' + e.message, true);
+  }
+}
+
+// 统计卡片：运行中 / 成功 / 失败 / 总数 / 手动增量
+function renderStats(jobs) {
+  if (!jobs || !jobs.length) {
+    document.getElementById('statRunning').textContent = 0;
+    document.getElementById('statSuccess').textContent = 0;
+    document.getElementById('statFailed').textContent = 0;
+    document.getElementById('statTotal').textContent = 0;
+    document.getElementById('statManual').textContent = 0;
+    return;
+  }
+  const cnt = { '运行中': 0, '成功': 0, '失败': 0 };
+  let manual = 0;
+  jobs.forEach(j => {
+    if (cnt[j.status] !== undefined) cnt[j.status]++;
+    if (j.type === 'manual-incremental') manual++;
+  });
+  document.getElementById('statRunning').textContent = cnt['运行中'];
+  document.getElementById('statSuccess').textContent = cnt['成功'];
+  document.getElementById('statFailed').textContent = cnt['失败'];
+  document.getElementById('statTotal').textContent = jobs.length;
+  document.getElementById('statManual').textContent = manual;
+}
+
+function renderTable(jobs) {
+  const tbody = document.querySelector('#jobTable tbody');
+  const empty = document.getElementById('empty');
+  tbody.innerHTML = '';
+  if (!jobs || !jobs.length) { empty.style.display = 'block'; return; }
+  empty.style.display = 'none';
+  jobs.forEach(j => {
+    const tr = document.createElement('tr');
+    // 运行中的任务：进度单元格显示占位（由 loadRunningProgress 异步填充）
+    const isRunning = j.status === '运行中';
+    const progressCell =
+      '<td><div class="cell-progress">' +
+        '<div class="track"><div class="bar" id="bar-' + escapeHtml(j.name) + '"></div></div>' +
+        '<span class="pct" id="pct-' + escapeHtml(j.name) + '">' + (isRunning ? '…' : '-') + '</span>' +
+      '</div></td>';
+    tr.innerHTML =
+      '<td class="mono">' + escapeHtml(j.name) + '</td>' +
+      '<td>' + escapeHtml(j.typeLabel || '未知') + '</td>' +
+      '<td>' + statusBadge(j.status) + '</td>' +
+      progressCell +
+      '<td>' + fmtTime(j.startTime) + '</td>' +
+      '<td>' + fmtTime(j.completionTime) + '</td>' +
+      '<td class="ops">' +
+        '<button onclick="viewLogs(\'' + escapeHtml(j.name) + '\')">查看日志</button>' +
+        '<button onclick="viewProgress(\'' + escapeHtml(j.name) + '\')">查看进度</button>' +
+        '<button class="danger" onclick="deleteJob(\'' + escapeHtml(j.name) + '\')">删除</button>' +
+      '</td>';
+    tbody.appendChild(tr);
+  });
+}
+
+// 为运行中的任务异步拉取进度，填充表格进度列（最多同时 3 个请求）
+async function loadRunningProgress(jobs) {
+  const running = (jobs || []).filter(j => j.status === '运行中');
+  for (let i = 0; i < running.length; i += 3) {
+    const batch = running.slice(i, i + 3);
+    await Promise.all(batch.map(async j => {
+      try {
+        const resp = await api('/api/tasks/' + encodeURIComponent(j.name) + '/progress');
+        const p = await resp.json();
+        const bar = document.getElementById('bar-' + j.name);
+        const pct = document.getElementById('pct-' + j.name);
+        if (bar && pct) {
+          const percent = Math.min(100, Math.max(0, p.percent || 0));
+          bar.style.width = percent.toFixed(1) + '%';
+          pct.textContent = percent.toFixed(1) + '%';
+        }
+      } catch (e) { /* 进度获取失败不影响列表 */ }
+    }));
+  }
+}
+
+// ===========================================================================
+// 定时任务详情
+// ===========================================================================
+
+// 拉取定时任务详情并渲染面板 + 暂停按钮
+async function loadCronStatus() {
+  try {
+    const resp = await api('/api/cronjob/status');
+    const data = await resp.json();
+    renderCronPanel(data);
+    renderCronButton(data.suspend);
+  } catch (e) {
+    // API 异常：保留默认显示
+    renderCronButton(false);
+  }
+}
+
+function renderCronPanel(d) {
+  document.getElementById('cronStatus').innerHTML = !d.exists
+    ? '<span class="badge pending">未创建</span>'
+    : statusBadge(d.suspend ? '等待中' : '运行中');
+  document.getElementById('cronSchedule').textContent = d.schedule || '-';
+  document.getElementById('cronLastRun').textContent = fmtTime(d.lastScheduleTime);
+  document.getElementById('cronNextRun').textContent = fmtTime(d.nextScheduleTime);
+  document.getElementById('cronLastSuccess').textContent = fmtTime(d.lastSuccessfulTime);
+  document.getElementById('cronConcurrency').textContent = d.concurrencyPolicy || '-';
+  document.getElementById('cronActive').textContent = d.activeJobs || 0;
+  document.getElementById('cronHistory').textContent =
+    (d.successfulJobsHistoryLimit || '-') + ' / ' + (d.failedJobsHistoryLimit || '-');
+}
+
+// 根据 suspend 状态切换按钮文字与配色
+function renderCronButton(suspended) {
+  const btn = document.getElementById('btnSuspend');
+  btn.textContent = suspended ? '恢复定时备份' : '暂停定时备份';
+  btn.className = 'btn ' + (suspended ? 'success' : 'warning');
+}
+
+// 点击暂停/恢复：根据当前按钮文字判断目标状态并发送
+async function toggleSuspend() {
+  const btn = document.getElementById('btnSuspend');
+  const currentlySuspended = btn.textContent.startsWith('恢复');
+  try {
+    await api('/api/cronjob/suspend', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ suspend: !currentlySuspended })
+    });
+    renderCronButton(!currentlySuspended);
+    showMsg(currentlySuspended ? '定时备份已恢复' : '定时备份已暂停', false);
+    loadCronStatus();
+  } catch (e) {
+    showMsg('操作失败: ' + e.message, true);
+  }
+}
+
+// ===========================================================================
+// 当前配置面板
+// ===========================================================================
+
+// 展开/收起配置面板，首次展开时拉取 /api/config
+function toggleConfigPanel() {
+  const panel = document.getElementById('configPanel');
+  if (panel.classList.contains('hidden')) {
+    panel.classList.remove('hidden');
+    loadConfig();
+  } else {
+    closeConfigPanel();
+  }
+}
+
+function closeConfigPanel() {
+  document.getElementById('configPanel').classList.add('hidden');
+}
+
+// 拉取当前配置并渲染为表格
+async function loadConfig() {
+  try {
+    const resp = await api('/api/config');
+    const c = await resp.json();
+    const rows = [
+      ['rclone 可执行文件', c.rcloneBin],
+      ['远程 / 桶', c.rcloneRemote + ':' + c.rcloneBucket +
+        (c.sourceSubdir ? '/' + c.sourceSubdir : '')],
+      ['目标目录', c.backupDestDir + (c.destDirReady ? '（可写）' : '（不存在或不可写！）')],
+      ['数据目录（SQLite / 日志）', c.dataDir],
+      ['带宽限制', c.bwLimit],
+      ['并发 transfers / checkers', c.transfers + ' / ' + c.checkers],
+      ['失败重试', c.retries + ' 次，间隔 ' + c.retriesSleep],
+      ['进度统计间隔', c.statsInterval],
+      ['定时计划', c.cronSchedule],
+      ['增量时长限制', c.incrementalMaxDuration],
+      ['历史保留（成功 / 失败）', c.successfulHistoryLimit + ' / ' + c.failedHistoryLimit],
+      ['凭证 AK/SK', c.credentialsReady ? '已配置（env_auth=true）' : '未配置（备份将无法认证！）'],
+      ['登录用户', c.loginUsername]
+    ];
+    document.querySelector('#configTable tbody').innerHTML = rows.map(r =>
+      '<tr><td class="mono">' + escapeHtml(r[0]) + '</td>' +
+      '<td class="mono">' + escapeHtml(String(r[1])) + '</td></tr>'
+    ).join('');
+  } catch (e) {
+    showMsg('获取配置失败: ' + e.message, true);
+  }
+}
+
+// ===========================================================================
+// 触发备份
+// ===========================================================================
+
+async function triggerFull() {
+  if (!confirm('确定触发全量备份吗？\n' +
+    '1) 全量备份耗时较长，且同一时间只允许运行一个全量任务；\n' +
+    '2) 触发后定时增量备份将自动暂停，全量完成后自动恢复。')) return;
+  try {
+    const resp = await api('/api/full-backup', { method: 'POST' });
+    const data = await resp.json();
+    showMsg(data.message || '全量备份任务已创建', false);
+    loadJobs();
+    loadCronStatus(); // 立即刷新（全量期间定时任务应显示为已暂停）
+  } catch (e) {
+    showMsg('触发全量备份失败: ' + e.message, true);
+  }
+}
+
+async function triggerIncremental() {
+  try {
+    const resp = await api('/api/incremental-backup', { method: 'POST' });
+    const data = await resp.json();
+    showMsg(data.message || '增量备份任务已创建', false);
+    loadJobs();
+  } catch (e) {
+    showMsg('触发增量备份失败: ' + e.message, true);
+  }
+}
+
+// ===========================================================================
+// 日志面板（静态 + SSE 流式）
+// ===========================================================================
+
+// 打开日志面板：先加载静态最近 200 行
+async function viewLogs(name) {
+  currentLogJob = name;
+  document.getElementById('logTitle').textContent = name;
+  document.getElementById('logPanel').classList.remove('hidden');
+  try {
+    const resp = await api('/api/tasks/' + encodeURIComponent(name) + '/logs?tail=200');
+    document.getElementById('logContent').textContent = await resp.text();
+  } catch (e) {
+    document.getElementById('logContent').textContent = '读取日志失败: ' + e.message;
+  }
+  startAutoScroll();
+}
+
+// 日志自动滚动到底部（每秒校正一次）
+function startAutoScroll() {
+  stopAutoScroll();
+  logTimer = setInterval(() => {
+    const el = document.getElementById('logContent');
+    el.scrollTop = el.scrollHeight;
+  }, 1000);
+}
+function stopAutoScroll() {
+  if (logTimer) { clearInterval(logTimer); logTimer = null; }
+}
+
+// 流式刷新开关：开启时用 EventSource 连接 SSE 接口，实时追加日志
+function toggleStream() {
+  const on = document.getElementById('streamToggle').checked;
+  if (!currentLogJob) return;
+  if (on) {
+    streamErrors = 0;
+    if (streamSource) streamSource.close();
+    const es = new EventSource('/api/tasks/' + encodeURIComponent(currentLogJob) + '/logs/stream');
+    streamSource = es;
+    const el = document.getElementById('logContent');
+    es.onmessage = (ev) => {
+      streamErrors = 0;
+      el.textContent += ev.data + '\n';
+      el.scrollTop = el.scrollHeight;
+    };
+    es.onerror = () => {
+      // EventSource 断线会自动重连；连续失败 3 次视为流已结束（Job 完成/日志不可用）
+      streamErrors++;
+      if (streamErrors >= 3) {
+        es.close();
+        streamSource = null;
+        document.getElementById('streamToggle').checked = false;
+        showMsg('日志流已结束', false);
+      }
+    };
+  } else {
+    if (streamSource) { streamSource.close(); streamSource = null; }
+  }
+}
+
+function closeLogPanel() {
+  document.getElementById('streamToggle').checked = false;
+  toggleStream();            // 关闭流式连接
+  stopAutoScroll();
+  currentLogJob = null;
+  document.getElementById('logPanel').classList.add('hidden');
+}
+
+// ===========================================================================
+// 进度面板
+// ===========================================================================
+
+// 打开进度面板：立即刷新一次，并每 5 秒自动轮询（与 rclone --stats 5s 对齐）
+async function viewProgress(name) {
+  currentProgressJob = name;
+  document.getElementById('progressTitle').textContent = name;
+  document.getElementById('progressPanel').classList.remove('hidden');
+  await refreshProgress();
+  stopProgressTimer();
+  progressTimer = setInterval(refreshProgress, 5000);
+}
+
+function stopProgressTimer() {
+  if (progressTimer) { clearInterval(progressTimer); progressTimer = null; }
+}
+
+// 获取并渲染最新进度
+async function refreshProgress() {
+  if (!currentProgressJob) return;
+  try {
+    const resp = await api('/api/tasks/' + encodeURIComponent(currentProgressJob) + '/progress');
+    renderProgress(await resp.json());
+  } catch (e) {
+    showMsg('获取进度失败: ' + e.message, true);
+  }
+}
+
+function renderProgress(p) {
+  const percent = Math.min(100, Math.max(0, p.percent || 0));
+  document.getElementById('progressBar').style.width = percent.toFixed(1) + '%';
+  document.getElementById('progressPercent').textContent = percent.toFixed(1) + '%';
+  const items = [
+    ['已传输', fmtBytes(p.bytes) + ' / ' + fmtBytes(p.totalBytes)],
+    ['文件数', (p.transfers || 0) + ' / ' + (p.totalTransfers || 0)],
+    ['当前速度', p.speedHuman || '-'],
+    ['已耗时', fmtDuration(p.elapsedTime)],
+    ['错误数', p.errors || 0]
+  ];
+  document.getElementById('progressDetail').innerHTML = items.map(i =>
+    '<li><span class="label">' + i[0] + '</span>' +
+    '<span class="value">' + escapeHtml(i[1]) + '</span></li>'
+  ).join('');
+}
+
+function closeProgressPanel() {
+  stopProgressTimer();
+  currentProgressJob = null;
+  document.getElementById('progressPanel').classList.add('hidden');
+}
+
+// ===========================================================================
+// 删除任务
+// ===========================================================================
+
+async function deleteJob(name) {
+  if (!confirm('确定删除任务 ' + name + ' 吗？\n将删除该任务的记录与日志（已同步到磁盘的数据不受影响）。')) return;
+  try {
+    const resp = await api('/api/tasks/' + encodeURIComponent(name), { method: 'DELETE' });
+    const data = await resp.json();
+    showMsg(data.message || '任务已删除', false);
+    loadJobs();
+  } catch (e) {
+    showMsg('删除失败: ' + e.message, true);
+  }
+}
+
+// ===========================================================================
+// 初始化
+// ===========================================================================
+
+function refreshAll() {
+  loadJobs();
+  loadCronStatus();
+}
+
+window.addEventListener('DOMContentLoaded', () => {
+  loadJobs();
+  loadCronStatus();
+  // 任务列表与定时调度状态每 10 秒轮询刷新
+  // （全量备份进行中内置定时调度会自动暂停，完成后自动恢复，面板与按钮需跟随）
+  setInterval(() => { loadJobs(); loadCronStatus(); }, 10000);
+});
+</script>
+</body>
+</html>
